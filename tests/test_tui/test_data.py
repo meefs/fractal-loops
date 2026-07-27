@@ -42,6 +42,7 @@ __all__ = [
     'test_build_tolerates_an_undecodable_status',
     'test_sync_folds_into_its_step',
     'test_drain_sync_lists_standalone',
+    'test_a_user_step_named_sync_lists_numbered',
     'test_open_spans_tick_through_a_sync_window',
     'test_user_root_degrades',
     'test_codex_carries_no_cost_or_sessions',
@@ -549,6 +550,69 @@ def test_drain_sync_lists_standalone(pair_tree: pathlib.Path) -> None:
     assert [row['duration'] for row in steps] == [60.0, 30.0, 20.0, 40.0]
     # the running spend still reads "through this row, syncs included"
     assert steps[-1]['iter_spend'] == pytest.approx(0.20)
+
+
+def test_a_user_step_named_sync_lists_numbered(pair_tree: pathlib.Path) -> None:
+    """A settled step named SYNC is a numbered step, not sync chrome.
+
+    'SYNC' also names the built-in pass, so SYNC rows classify
+    structurally: a settled row alone on its number -- a user step file
+    named SYNC, run with sync mode off -- lists under its own number,
+    counts toward the pipeline denominator, is the card's displayed step,
+    and its log rows drop the sync muting. A still-open SYNC row keeps the
+    standalone ``sync`` shape (a live built-in pass precedes its step's
+    row); a settled pass whose step never launched shares the user-step
+    shape and deliberately reads as that step's numbered row.
+    """
+    alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
+    with deterministic_core() as clock:
+        clock.at(600.0)
+        run_id = alpha.record.run_start()
+        clock.at(590.0)
+        iter_id = alpha.record.iter_start(run_id=run_id, iter=1)
+        # sync mode off: SYNC here is the node's own second step file
+        seeded = (
+            (1, 'PREPARE', 580.0, 540.0, 0.04),
+            (2, 'SYNC', 530.0, 500.0, 0.02),
+        )
+        for step, name, started, ended, cost in seeded:
+            clock.at(started)
+            step_id = alpha.record.step_start(
+                iter_id=iter_id,
+                run_id=run_id,
+                step=step,
+                step_name=name,
+            )
+            alpha.record.step_cost(step_id=step_id, cost=cost)
+            clock.at(ended)
+            alpha.record.step_end(step_id=step_id, status='completed', exit_code=0)
+        # a still-open SYNC row, shape-identical to a live built-in pass
+        clock.at(490.0)
+        alpha.record.step_start(
+            iter_id=iter_id,
+            run_id=run_id,
+            step=3,
+            step_name='SYNC',
+        )
+    data = TuiData(resolve_node(pair_tree))
+    builder = SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
+    snap = builder.build('main.alpha')
+    steps = snap.history[0]['iters'][0]['steps']
+    assert [row['label'] for row in steps] == [
+        'step 1: PREPARE',
+        'step 2: SYNC',
+        'sync',
+    ]
+    # the settled SYNC step is the displayed step and counts in step N/N
+    m = snap.measures
+    assert (m['step'], m['step_name'], m['step_total']) == (2, 'SYNC', 2)
+    # the log mutes only the still-open row, never the settled SYNC step
+    named = [row for row in snap.log if row['kind'] == 'step' and row['name'] == 'SYNC']
+    assert {(row['event'], row['sync']) for row in named} == {
+        ('start', False),
+        ('end', False),
+        ('start', True),
+    }
 
 
 def test_open_spans_tick_through_a_sync_window(pair_tree: pathlib.Path) -> None:
